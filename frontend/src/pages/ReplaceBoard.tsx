@@ -21,6 +21,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import { DeleteOutlined, EditOutlined, PlusOutlined, WarningFilled } from '@ant-design/icons';
@@ -39,7 +40,6 @@ import {
   patchReplaceFilter,
   removeReplace,
   resetReplaceFilter,
-  selectCalibrations,
   selectReplaceFilter,
   selectReplaces,
   transitionReplace,
@@ -52,7 +52,18 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
-import { daysUntilDue, type Instrument } from '@/types/instrument';
+import {
+  CALIBRATION_CYCLE_DAYS,
+  type Instrument,
+} from '@/types/instrument';
+import {
+  activeDeactivation,
+  deactivationDurationText,
+  deactivationExcludeReason,
+  scheduledDaysUntilDue,
+  type Deactivation,
+} from '@/types/deactivation';
+import DeactivationModal from '@/components/instrument/DeactivationModal';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
 
@@ -66,7 +77,7 @@ interface ReplaceFormValues {
   remark: string;
 }
 
-/** 仪器评定行：标定结论、待标定天数与更换状态 */
+/** 仪器评定行：标定结论、待标定天数、停用排除信息与更换状态 */
 interface AssessmentRow {
   instrument: Instrument;
   stationCode: string;
@@ -75,6 +86,14 @@ interface AssessmentRow {
   lastDate: string;
   dueInDays: number;
   overdue: boolean;
+  /** 当前是否停用中（停用期间不参与超期统计与按期标定率） */
+  deactivated: boolean;
+  /** 当前生效的停用段 */
+  activeDeactivation: Deactivation | null;
+  /** 排除原因文案 */
+  excludeReason: string;
+  /** 历史停用段数 */
+  deactivationCount: number;
   lastVerdict: string;
   calibrationCount: number;
   replace: Replace | null;
@@ -88,13 +107,13 @@ export default function ReplaceBoard() {
   const instruments = useAppSelector(selectInstruments);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
-  const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
   const filter = useAppSelector(selectReplaceFilter);
   const { histories } = useCalibHistory();
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [deactivationInstrument, setDeactivationInstrument] = useState<Instrument | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [form] = Form.useForm<ReplaceFormValues>();
 
@@ -102,32 +121,28 @@ export default function ReplaceBoard() {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 仪器评定行：结合标定结论、停用排除与更换记录 */
   const rows = useMemo<AssessmentRow[]>(() => {
-    return instruments
-      .map((instrument) => {
-        const station = stations.find((row) => row.id === instrument.stationId);
-        const array = station ? arrays.find((row) => row.id === station.arrayId) : undefined;
-        const own = calibrations
-          .filter((row) => row.instrumentId === instrument.id)
-          .sort((a, b) => b.date.localeCompare(a.date));
-        const latest = own[0];
-        const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
+    return histories
+      .map((history) => {
         const replace =
           replaces
-            .filter((row) => row.instrumentId === instrument.id)
+            .filter((row) => row.instrumentId === history.instrument.id)
             .sort((a, b) => b.date.localeCompare(a.date))[0] ?? null;
         return {
-          instrument,
-          stationCode: station?.code ?? '未知台站',
-          arrayId: array?.id ?? '',
-          arrayName: array?.name ?? '未知台阵',
-          lastDate,
-          dueInDays,
-          overdue: dueInDays < 0,
-          lastVerdict: latest ? latest.responseVerdict : '待判定',
-          calibrationCount: own.length,
+          instrument: history.instrument,
+          stationCode: history.stationCode,
+          arrayId: history.arrayId,
+          arrayName: history.arrayName,
+          lastDate: history.latest ? history.latest.date : history.instrument.installDate,
+          dueInDays: history.dueInDays,
+          overdue: history.overdue,
+          deactivated: history.deactivated,
+          activeDeactivation: history.activeDeactivation,
+          excludeReason: history.excludeReason,
+          deactivationCount: history.deactivations.length,
+          lastVerdict: history.latest ? history.latest.responseVerdict : '待判定',
+          calibrationCount: history.count,
           replace,
         };
       })
@@ -143,18 +158,31 @@ export default function ReplaceBoard() {
           if (!filter.states.includes(state)) return false;
         }
         return true;
-      })
-      .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, filter, instruments, replaces, stations]);
+      });
+  }, [filter, histories, replaces]);
 
   const totals = useMemo(() => {
-    const overdue = rows.filter((row) => row.overdue).length;
-    const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
+    // 停用中的仪器整体排除：既不计入超期台数，也不计入按期标定率的分母
+    const activeRows = rows.filter((row) => !row.deactivated);
+    const excluded = rows.length - activeRows.length;
+    const overdue = activeRows.filter((row) => row.overdue).length;
+    const unqualified = activeRows.filter((row) => row.lastVerdict === '不合格').length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
     const cycleRate =
-      rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
+      activeRows.length === 0
+        ? 0
+        : Number((((activeRows.length - overdue) / activeRows.length) * 100).toFixed(1));
+    return {
+      instruments: rows.length,
+      activeInstruments: activeRows.length,
+      excluded,
+      overdue,
+      unqualified,
+      pendingReplace,
+      closedReplace,
+      cycleRate,
+    };
   }, [replaces, rows]);
 
   const replaceRows = useMemo(
@@ -268,6 +296,7 @@ export default function ReplaceBoard() {
           </Typography.Title>
           <p className="gb-hint">
             按标定周期（365 天）与脉冲响应结论评定仪器是否合格；超期未标定与不合格仪器高亮提示，可直接登记更换并跟踪到复核闭环。
+            停用登记中（恢复日期为空）的仪器不参与超期统计与按期标定率，并在表内标出排除原因；停用跨过原到期日恢复的，到期日按停用天数顺延。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreate()}>
@@ -276,7 +305,7 @@ export default function ReplaceBoard() {
       </div>
 
       <div className="gb-stats-row">
-        <StatBadge label="仪器台数" value={totals.instruments} suffix="台" tone="primary" />
+        <StatBadge label="参评仪器" value={totals.activeInstruments} suffix="台" tone="primary" />
         <StatBadge
           label="超期未标定"
           value={totals.overdue}
@@ -290,6 +319,12 @@ export default function ReplaceBoard() {
           tone={totals.unqualified > 0 ? 'warning' : 'success'}
         />
         <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
+        <StatBadge
+          label="停用排除"
+          value={totals.excluded}
+          suffix="台"
+          tone={totals.excluded > 0 ? 'default' : 'success'}
+        />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
         <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
       </div>
@@ -299,7 +334,7 @@ export default function ReplaceBoard() {
           type="warning"
           showIcon
           icon={<WarningFilled />}
-          message={`存在 ${overdueHistories.length} 台超期未标定仪器，请优先安排标定或登记更换`}
+          message={`存在 ${overdueHistories.length} 台超期未标定仪器，请优先安排标定或登记更换（停用中仪器已排除）`}
           description={overdueHistories
             .slice(0, 5)
             .map(
@@ -309,7 +344,7 @@ export default function ReplaceBoard() {
             .join('；')}
         />
       ) : (
-        <Alert type="success" showIcon message="全部仪器均在标定周期内，无需特别提醒" />
+        <Alert type="success" showIcon message="在用仪器均在标定周期内，无需特别提醒（停用中仪器不参与评定）" />
       )}
 
       <FilterBar
@@ -346,7 +381,9 @@ export default function ReplaceBoard() {
           className="gb-table-compact"
           dataSource={rows}
           pagination={{ pageSize: 10, showSizeChanger: false }}
-          rowClassName={(row) => (row.overdue || row.lastVerdict === '不合格' ? 'gb-row-danger' : '')}
+          rowClassName={(row) =>
+            row.deactivated ? 'gb-row-muted' : row.overdue || row.lastVerdict === '不合格' ? 'gb-row-danger' : ''
+          }
           columns={[
             {
               title: '仪器',
@@ -382,12 +419,45 @@ export default function ReplaceBoard() {
             },
             {
               title: '标定提醒',
-              width: 160,
-              render: (_: unknown, row: AssessmentRow) => (
-                <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
-                  {row.overdue ? `超期 ${Math.abs(row.dueInDays)} 天` : `剩余 ${row.dueInDays} 天`}
-                </span>
-              ),
+              width: 170,
+              render: (_: unknown, row: AssessmentRow) =>
+                row.deactivated ? (
+                  <Tooltip title={row.excludeReason} placement="topLeft">
+                    <Tag color="default" style={{ cursor: 'help' }}>
+                      停用排除·不统计
+                    </Tag>
+                  </Tooltip>
+                ) : (
+                  <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
+                    {row.overdue ? `超期 ${Math.abs(row.dueInDays)} 天` : `剩余 ${row.dueInDays} 天`}
+                  </span>
+                ),
+            },
+            {
+              title: '停用 / 排除原因',
+              width: 200,
+              render: (_: unknown, row: AssessmentRow) =>
+                row.activeDeactivation ? (
+                  <Tooltip title={row.excludeReason} placement="topLeft">
+                    <div style={{ cursor: 'help' }}>
+                      <Tag color="default">停用中</Tag>
+                      <div className="gb-hint">
+                        {row.activeDeactivation.startDate} 起停用，{deactivationDurationText(row.activeDeactivation)}
+                      </div>
+                      <div className="gb-hint" style={{ color: '#6b7c8c' }}>
+                        {row.activeDeactivation.reason}
+                      </div>
+                    </div>
+                  </Tooltip>
+                ) : row.deactivationCount > 0 ? (
+                  <Tooltip title="历史停用段已按天数顺延到期日，当前已恢复参评">
+                    <Tag color="green" style={{ cursor: 'help' }}>
+                      已恢复·{row.deactivationCount} 段
+                    </Tag>
+                  </Tooltip>
+                ) : (
+                  <span className="gb-hint">—</span>
+                ),
             },
             {
               title: '标定结论',
@@ -420,9 +490,12 @@ export default function ReplaceBoard() {
             },
             {
               title: '操作',
-              width: 260,
+              width: 320,
               render: (_: unknown, row: AssessmentRow) => (
-                <Space size={6}>
+                <Space size={6} wrap>
+                  <Button size="small" onClick={() => setDeactivationInstrument(row.instrument)}>
+                    停用登记
+                  </Button>
                   <Button size="small" type="primary" onClick={() => openCreate(row.instrument.id)}>
                     登记更换
                   </Button>
@@ -533,12 +606,24 @@ export default function ReplaceBoard() {
 
       <p className="gb-hint">
         更换完成后点击「→ 已更换」，系统会把新序列号回写到仪器档案并置为在用；再流转到「已复核」即完成闭环。
+        停用封存的仪器请先在仪器行做停用登记，停用期间不安排外业标定；恢复后到期日按停用天数顺延。
         前往
         <Button type="link" size="small" onClick={() => navigate(ROUTES.calibrations)}>
           标定记录台
         </Button>
         可查看历次灵敏度趋势。
       </p>
+
+      <DeactivationModal
+        open={deactivationInstrument !== null}
+        instrumentId={deactivationInstrument?.id ?? null}
+        instrumentLabel={
+          deactivationInstrument
+            ? `${deactivationInstrument.model}（${deactivationInstrument.serialNo}）`
+            : ''
+        }
+        onClose={() => setDeactivationInstrument(null)}
+      />
 
       <Modal
         open={modalOpen}

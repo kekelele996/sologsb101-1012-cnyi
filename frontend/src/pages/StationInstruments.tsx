@@ -23,6 +23,7 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
 import { DeleteOutlined, EditOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons';
@@ -59,17 +60,28 @@ import {
   updateInstrument,
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
+import { selectDeactivations } from '@/stores/deactivationSlice';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
 import {
   COMMON_MODELS,
   INSTRUMENT_STATES,
   INSTRUMENT_TYPES,
+  CALIBRATION_CYCLE_DAYS,
   createEmptyInstrumentDraft,
   daysUntilDue,
   type Instrument,
   type InstrumentState,
   type InstrumentType,
 } from '@/types/instrument';
+import {
+  activeDeactivation,
+  deactivationDurationText,
+  deactivationExcludeReason,
+  isInstrumentDeactivated,
+  scheduledDaysUntilDue,
+  type Deactivation,
+} from '@/types/deactivation';
+import DeactivationModal from '@/components/instrument/DeactivationModal';
 import { formatLatLng, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -91,13 +103,14 @@ interface InstrumentFormValues {
   remark: string;
 }
 
-/** 台站行统计：仪器数、标定数、不合格数与超期台数 */
+/** 台站行统计：仪器数、标定数、不合格数、超期台数与停用排除台数 */
 interface StationRow {
   station: SeisStation;
   instruments: Instrument[];
   calibrationCount: number;
   unqualified: number;
   overdue: number;
+  deactivated: number;
   worstVerdict: string;
 }
 
@@ -115,12 +128,14 @@ export default function StationInstruments() {
   const allInstruments = useAppSelector(selectInstruments);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
+  const deactivations = useAppSelector(selectDeactivations);
 
   const [stationModalOpen, setStationModalOpen] = useState(false);
   const [editingStationId, setEditingStationId] = useState<string | null>(null);
   const [instrumentModalOpen, setInstrumentModalOpen] = useState(false);
   const [editingInstrumentId, setEditingInstrumentId] = useState<string | null>(null);
   const [activeStationId, setActiveStationId] = useState<string | null>(null);
+  const [deactivationInstrument, setDeactivationInstrument] = useState<Instrument | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [stationForm] = Form.useForm<StationFormValues>();
   const [instrumentForm] = Form.useForm<InstrumentFormValues>();
@@ -164,23 +179,34 @@ export default function StationInstruments() {
           const unqualified = stationCalibrations.filter(
             (calibration) => calibration.responseVerdict === '不合格'
           ).length;
-          const overdue = stationInstruments.filter((instrument) => {
+          let overdue = 0;
+          let deactivatedCount = 0;
+          stationInstruments.forEach((instrument) => {
             const own = calibrations
               .filter((calibration) => calibration.instrumentId === instrument.id)
               .sort((a, b) => b.date.localeCompare(a.date));
+            const segments = deactivations.filter(
+              (deactivation) => deactivation.instrumentId === instrument.id
+            );
+            // 停用中的仪器不参与超期统计，恢复仪器的到期日按停用天数顺延
+            if (isInstrumentDeactivated(segments)) {
+              deactivatedCount += 1;
+              return;
+            }
             const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
-          }).length;
+            if (scheduledDaysUntilDue(last, segments, CALIBRATION_CYCLE_DAYS) < 0) overdue += 1;
+          });
           return {
             station,
             instruments: stationInstruments,
             calibrationCount: stationCalibrations.length,
             unqualified,
             overdue,
+            deactivated: deactivatedCount,
             worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
           };
         }),
-    [allInstruments, calibrations, stationFilter, stations]
+    [allInstruments, calibrations, deactivations, stationFilter, stations]
   );
 
   const totals = useMemo(
@@ -190,6 +216,7 @@ export default function StationInstruments() {
       calibrations: rows.reduce((sum, row) => sum + row.calibrationCount, 0),
       unqualified: rows.reduce((sum, row) => sum + row.unqualified, 0),
       overdue: rows.reduce((sum, row) => sum + row.overdue, 0),
+      deactivated: rows.reduce((sum, row) => sum + row.deactivated, 0),
     }),
     [rows]
   );
@@ -421,6 +448,12 @@ export default function StationInstruments() {
           suffix="台"
           tone={totals.overdue > 0 ? 'warning' : 'success'}
         />
+        <StatBadge
+          label="停用排除"
+          value={totals.deactivated}
+          suffix="台"
+          tone={totals.deactivated > 0 ? 'default' : 'success'}
+        />
       </div>
 
       <FilterBar
@@ -517,9 +550,13 @@ export default function StationInstruments() {
             },
             {
               title: '标定提醒',
-              width: 130,
-              render: (_: unknown, row: StationRow) =>
-                row.overdue > 0 ? <Tag color="red">超期 {row.overdue} 台</Tag> : <Tag color="green">按期</Tag>,
+              width: 150,
+              render: (_: unknown, row: StationRow) => (
+                <Space size={4} wrap>
+                  {row.overdue > 0 ? <Tag color="red">超期 {row.overdue} 台</Tag> : <Tag color="green">按期</Tag>}
+                  {row.deactivated > 0 ? <Tag>停用排除 {row.deactivated} 台</Tag> : null}
+                </Space>
+              ),
             },
             {
               title: '综合结论',
@@ -606,6 +643,33 @@ export default function StationInstruments() {
                   ),
                 },
                 {
+                  title: '停用登记',
+                  width: 150,
+                  render: (_: unknown, instrument: Instrument) => {
+                    const ownSegments = deactivations.filter((row) => row.instrumentId === instrument.id);
+                    const active = activeDeactivation(ownSegments);
+                    if (active) {
+                      return (
+                        <Tooltip title={deactivationExcludeReason(active)}>
+                          <Tag color="default" style={{ cursor: 'help' }}>
+                            停用中·{deactivationDurationText(active)}
+                          </Tag>
+                        </Tooltip>
+                      );
+                    }
+                    if (ownSegments.length > 0) {
+                      return (
+                        <Tooltip title={`历史停用 ${ownSegments.length} 段，到期日已按停用天数顺延`}>
+                          <Tag color="green" style={{ cursor: 'help' }}>
+                            已恢复·{ownSegments.length} 段
+                          </Tag>
+                        </Tooltip>
+                      );
+                    }
+                    return <span className="gb-hint">无停用</span>;
+                  },
+                },
+                {
                   title: '标定次数',
                   width: 100,
                   align: 'right',
@@ -637,13 +701,31 @@ export default function StationInstruments() {
                 },
                 {
                   title: '距下次标定',
-                  width: 130,
+                  width: 180,
                   render: (_: unknown, instrument: Instrument) => {
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));
+                    const segments = deactivations.filter(
+                      (row) => row.instrumentId === instrument.id
+                    );
+                    const active = activeDeactivation(segments);
+                    if (active) {
+                      return (
+                        <Tooltip title={deactivationExcludeReason(active)} placement="topLeft">
+                          <div>
+                            <Tag color="default" style={{ cursor: 'help' }}>
+                              停用排除·不统计
+                            </Tag>
+                            <div className="gb-hint">
+                              {active.startDate} 起停用{active.recoverDate ? '' : '，未恢复'}
+                            </div>
+                          </div>
+                        </Tooltip>
+                      );
+                    }
                     const last = own.length > 0 ? own[0].date : instrument.installDate;
-                    const days = daysUntilDue(last, instrument.installDate);
+                    const days = scheduledDaysUntilDue(last, segments, CALIBRATION_CYCLE_DAYS);
                     return (
                       <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
                         {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}
@@ -653,9 +735,12 @@ export default function StationInstruments() {
                 },
                 {
                   title: '操作',
-                  width: 190,
+                  width: 250,
                   render: (_: unknown, instrument: Instrument) => (
-                    <Space size={6}>
+                    <Space size={6} wrap>
+                      <Button size="small" onClick={() => setDeactivationInstrument(instrument)}>
+                        停用登记
+                      </Button>
                       <Button size="small" onClick={() => openInstrumentEdit(activeStation, instrument)}>
                         编辑
                       </Button>
@@ -695,7 +780,20 @@ export default function StationInstruments() {
       <p className="gb-hint">
         更换提醒：当仪器标定超期或结论不合格时，可到「合格评定与更换」页登记更换并跟踪到复核闭环；
         更换完成后将自动把新序列号回写到仪器档案。当前共 {replaces.length} 条更换记录。
+        仪器停用请做停用登记（填停用与恢复日期，恢复日期空着表示仍在停用）：停用期间标定周期暂停、
+        不参与超期统计与按期标定率，恢复后到期日按停用天数顺延；同一台仪器一年停用多次的，每段单独登记。
       </p>
+
+      <DeactivationModal
+        open={deactivationInstrument !== null}
+        instrumentId={deactivationInstrument?.id ?? null}
+        instrumentLabel={
+          deactivationInstrument
+            ? `${deactivationInstrument.model}（${deactivationInstrument.serialNo}）`
+            : ''
+        }
+        onClose={() => setDeactivationInstrument(null)}
+      />
 
       <Modal
         open={stationModalOpen}

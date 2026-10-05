@@ -77,15 +77,20 @@ export const updateInstrument = createAsyncThunk(
   }
 );
 
-/** 删除仪器：级联删除标定与更换记录 */
+/** 删除仪器：级联删除标定、更换与停用记录 */
 export const removeInstrument = createAsyncThunk(
   'instrument/removeInstrument',
   async (instrumentId: string) => {
-    await db.transaction('rw', [db.instruments, db.calibrations, db.replaces], async () => {
-      await db.calibrations.where('instrumentId').equals(instrumentId).delete();
-      await db.replaces.where('instrumentId').equals(instrumentId).delete();
-      await db.instruments.delete(instrumentId);
-    });
+    await db.transaction(
+      'rw',
+      [db.instruments, db.calibrations, db.replaces, db.deactivations],
+      async () => {
+        await db.calibrations.where('instrumentId').equals(instrumentId).delete();
+        await db.replaces.where('instrumentId').equals(instrumentId).delete();
+        await db.deactivations.where('instrumentId').equals(instrumentId).delete();
+        await db.instruments.delete(instrumentId);
+      }
+    );
     return instrumentId;
   }
 );

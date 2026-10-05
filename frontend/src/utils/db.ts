@@ -12,9 +12,10 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { Deactivation } from '@/types/deactivation';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +37,7 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  deactivations: Deactivation[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +46,7 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  deactivations!: Table<Deactivation, string>;
 
   constructor() {
     super(DB_NAME);
@@ -58,7 +61,7 @@ export class SeisArrayDatabase extends Dexie {
     });
 
     // v2：补齐筛选与统计需要的索引（孔径/布设日期、经纬度/基岩、类型/序列号、灵敏度/结论、原因）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
         stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
@@ -85,6 +88,39 @@ export class SeisArrayDatabase extends Dexie {
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
               Object.assign(row, factory());
             });
+        }
+      });
+
+    // v3：新增仪器停用登记表（deactivations），支持一台仪器多段停用与恢复
+    this.version(DB_VERSION)
+      .stores({
+        arrays: 'id, name, state, apertureKm, deployDate, department, updatedAt',
+        stations: 'id, arrayId, code, lat, lng, elevM, bedrock, updatedAt',
+        instruments: 'id, stationId, type, model, serialNo, installDate, state, updatedAt',
+        calibrations: 'id, instrumentId, date, sensitivity, selfNoise, responseVerdict, updatedAt',
+        replaces: 'id, instrumentId, state, date, newSerialNo, updatedAt',
+        deactivations: 'id, instrumentId, startDate, recoverDate, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 历史「已停用」仪器没有停用登记：回填一段「未恢复」的停用段，停用日期取仪器安装日期，
+        // 使其立即按新规则排除出超期统计，班组可后续补录真实停用/恢复日期。
+        const now = Date.now();
+        const stoppedInstruments = await tx
+          .table('instruments')
+          .filter((row: Instrument) => row.state === '已停用')
+          .toArray();
+        const legacyRows: Deactivation[] = stoppedInstruments.map((instrument) => ({
+          id: createId('dea'),
+          instrumentId: instrument.id,
+          startDate: instrument.installDate,
+          recoverDate: '',
+          reason: '历史已停用仪器（系统迁移回填，请补录停用与恢复日期）',
+          remark: 'v3 迁移自动生成',
+          createdAt: now,
+          updatedAt: now,
+        }));
+        if (legacyRows.length > 0) {
+          await tx.table('deactivations').bulkAdd(legacyRows);
         }
       });
   }
@@ -127,6 +163,16 @@ interface SeedCalibration {
   remark: string;
 }
 
+interface SeedDeactivation {
+  id: string;
+  instrumentId: string;
+  startDate: string;
+  /** 空串表示未恢复 */
+  recoverDate: string;
+  reason: string;
+  remark: string;
+}
+
 interface SeedInstrument {
   id: string;
   stationId: string;
@@ -137,6 +183,7 @@ interface SeedInstrument {
   state: Instrument['state'];
   remark: string;
   calibrations: SeedCalibration[];
+  deactivations?: SeedDeactivation[];
 }
 
 interface SeedStation {
@@ -162,8 +209,9 @@ interface SeedArray {
 }
 
 /**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
- * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
+ * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换 + 4 段停用登记，
+ * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本，
+ * 停用样本含：未恢复停用、停用跨过原到期日后恢复、同一年分两段停用。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now();
@@ -242,6 +290,25 @@ export async function seedDemoData(): Promise<void> {
                   remark: '首次标定',
                 },
               ],
+              // 同一年分两段停用、各自恢复：历史停用段不顺延掉真实超期，恢复后仍按超期处理
+              deactivations: [
+                {
+                  id: 'dea_ltx01_st_1',
+                  instrumentId: 'ins_ltx01_st',
+                  startDate: '2023-01-10',
+                  recoverDate: '2023-03-15',
+                  reason: '台站停电 / 断网，暂停观测',
+                  remark: '冬季供电中断，设备封存',
+                },
+                {
+                  id: 'dea_ltx01_st_2',
+                  instrumentId: 'ins_ltx01_st',
+                  startDate: '2023-10-05',
+                  recoverDate: '2023-11-20',
+                  reason: '临时借调至其他工区',
+                  remark: '借调结束后重新安装',
+                },
+              ],
             },
           ],
         },
@@ -296,6 +363,17 @@ export async function seedDemoData(): Promise<void> {
                   operator: '周渝',
                   agency: '省地震局计量站',
                   remark: '自噪超标，判定不合格',
+                },
+              ],
+              // 未恢复停用段：恢复日期空着，长期排除出超期统计与按期标定率
+              deactivations: [
+                {
+                  id: 'dea_ltx02_st_1',
+                  instrumentId: 'ins_ltx02_st',
+                  startDate: '2024-06-20',
+                  recoverDate: '',
+                  reason: '雷击等损坏待更换，停用封存',
+                  remark: '新仪器到货后走更换流程',
                 },
               ],
             },
@@ -384,6 +462,17 @@ export async function seedDemoData(): Promise<void> {
                   operator: '陈立群',
                   agency: '国家测震台网计量中心',
                   remark: '变化 0.97%，合格',
+                },
+              ],
+              // 停用跨过原到期日（2025-09-30）后恢复：到期日按停用天数顺延，恢复后不判超期
+              deactivations: [
+                {
+                  id: 'dea_hx01_bb_1',
+                  instrumentId: 'ins_hx01_bb',
+                  startDate: '2025-08-01',
+                  recoverDate: daysAgo(15),
+                  reason: '场地改造或汛期避险，设备撤收',
+                  remark: '场地改造完成后恢复观测，标定周期顺延',
                 },
               ],
             },
@@ -501,6 +590,7 @@ export async function seedDemoData(): Promise<void> {
       const stationRows: SeisStation[] = [];
       const instrumentRows: Instrument[] = [];
       const calibrationRows: Calibration[] = [];
+      const deactivationRows: Deactivation[] = [];
 
       arrays.forEach((seed, arrayIndex) => {
         const { stations, ...arrayRest } = seed;
@@ -509,7 +599,7 @@ export async function seedDemoData(): Promise<void> {
           const { instruments, ...stationRest } = stationSeed;
           stationRows.push({ ...stationRest, ...stamp(100 + arrayIndex * 100 + stationIndex) });
           instruments.forEach((instrumentSeed, instrumentIndex) => {
-            const { calibrations, ...instrumentRest } = instrumentSeed;
+            const { calibrations, deactivations = [], ...instrumentRest } = instrumentSeed;
             instrumentRows.push({
               ...instrumentRest,
               ...stamp(200 + arrayIndex * 200 + stationIndex * 50 + instrumentIndex),
@@ -528,6 +618,18 @@ export async function seedDemoData(): Promise<void> {
                 ),
               });
             });
+            deactivations.forEach((deactivationSeed, deactivationIndex) => {
+              deactivationRows.push({
+                ...deactivationSeed,
+                ...stamp(
+                  600 +
+                    arrayIndex * 400 +
+                    stationIndex * 100 +
+                    instrumentIndex * 20 +
+                    deactivationIndex
+                ),
+              });
+            });
           });
         });
       });
@@ -537,6 +639,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.deactivations.bulkPut(deactivationRows);
     }
   );
 }
@@ -555,7 +658,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.deactivations],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +666,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.deactivations.clear(),
       ]);
     }
   );
@@ -576,14 +680,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, deactivations] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.deactivations.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, deactivations };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */
