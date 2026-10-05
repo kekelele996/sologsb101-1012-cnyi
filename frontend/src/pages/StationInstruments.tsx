@@ -1,6 +1,7 @@
 /**
  * 模块 2：/stations/:id/instruments 台站仪器登记与安装位置维护
  * 序列号唯一性校验；深链访问时台阵不存在给出友好空态。
+ * 仪器停用登记：每段单独记录，停用中的仪器不参与超期统计并在清单标出排除原因。
  * 复用 <StatBadge>、<QualifyTag>。
  */
 import { useEffect, useMemo, useState } from 'react';
@@ -23,9 +24,10 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, PauseCircleOutlined, PlusOutlined, SyncOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
@@ -51,12 +53,17 @@ import {
 import {
   bulkSetInstrumentState,
   createInstrument,
+  createSuspension,
   patchDraft,
   removeInstrument,
+  removeSuspension,
   resetDraft,
+  resumeSuspension,
   selectInstruments,
   selectInstrumentsOfStation,
+  selectSuspensions,
   updateInstrument,
+  updateSuspension,
 } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
 import { BEDROCK_TYPES, validateLatLng, type BedrockType, type SeisStation } from '@/types/station';
@@ -70,6 +77,16 @@ import {
   type InstrumentState,
   type InstrumentType,
 } from '@/types/instrument';
+import {
+  SUSPENSION_REASON_TEMPLATES,
+  activeSuspensionOf,
+  daysUntilDueExcludingSuspension,
+  isSuspendedNow,
+  suspendedDaysAfter,
+  suspensionExclusionText,
+  suspensionRangeText,
+  type Suspension,
+} from '@/types/suspension';
 import { formatLatLng, round } from '@/utils/geo';
 import { initDatabase } from '@/utils/db';
 
@@ -91,6 +108,12 @@ interface InstrumentFormValues {
   remark: string;
 }
 
+interface SuspensionFormValues {
+  startDate: dayjs.Dayjs | null;
+  endDate: dayjs.Dayjs | null;
+  reason: string;
+}
+
 /** 台站行统计：仪器数、标定数、不合格数与超期台数 */
 interface StationRow {
   station: SeisStation;
@@ -98,6 +121,8 @@ interface StationRow {
   calibrationCount: number;
   unqualified: number;
   overdue: number;
+  /** 停用中的仪器台数（不参与超期统计） */
+  suspended: number;
   worstVerdict: string;
 }
 
@@ -113,6 +138,7 @@ export default function StationInstruments() {
   const stations = useAppSelector((state) => selectStationsOfArray(state, arrayId));
   const stationFilter = useAppSelector(selectStationFilter);
   const allInstruments = useAppSelector(selectInstruments);
+  const suspensions = useAppSelector(selectSuspensions);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
 
@@ -121,9 +147,12 @@ export default function StationInstruments() {
   const [instrumentModalOpen, setInstrumentModalOpen] = useState(false);
   const [editingInstrumentId, setEditingInstrumentId] = useState<string | null>(null);
   const [activeStationId, setActiveStationId] = useState<string | null>(null);
+  const [suspensionInstrumentId, setSuspensionInstrumentId] = useState<string | null>(null);
+  const [editingSuspensionId, setEditingSuspensionId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [stationForm] = Form.useForm<StationFormValues>();
   const [instrumentForm] = Form.useForm<InstrumentFormValues>();
+  const [suspensionForm] = Form.useForm<SuspensionFormValues>();
 
   useEffect(() => {
     if (arrays.length === 0) void initDatabase();
@@ -164,23 +193,31 @@ export default function StationInstruments() {
           const unqualified = stationCalibrations.filter(
             (calibration) => calibration.responseVerdict === '不合格'
           ).length;
+          // 停用中的仪器不参与超期统计；有停用史的按顺延后的到期日判定
           const overdue = stationInstruments.filter((instrument) => {
+            if (isSuspendedNow(suspensions, instrument.id)) return false;
             const own = calibrations
               .filter((calibration) => calibration.instrumentId === instrument.id)
               .sort((a, b) => b.date.localeCompare(a.date));
-            const last = own.length > 0 ? own[0].date : instrument.installDate;
-            return daysUntilDue(last, instrument.installDate) < 0;
+            const last = own.length > 0 ? own[0].date : null;
+            return (
+              daysUntilDueExcludingSuspension(last, instrument.installDate, suspensions, instrument.id) < 0
+            );
           }).length;
+          const suspended = stationInstruments.filter((instrument) =>
+            isSuspendedNow(suspensions, instrument.id)
+          ).length;
           return {
             station,
             instruments: stationInstruments,
             calibrationCount: stationCalibrations.length,
             unqualified,
             overdue,
+            suspended,
             worstVerdict: unqualified > 0 ? '不合格' : stationCalibrations.length > 0 ? '合格' : '待判定',
           };
         }),
-    [allInstruments, calibrations, stationFilter, stations]
+    [allInstruments, calibrations, stationFilter, stations, suspensions]
   );
 
   const totals = useMemo(
@@ -190,6 +227,7 @@ export default function StationInstruments() {
       calibrations: rows.reduce((sum, row) => sum + row.calibrationCount, 0),
       unqualified: rows.reduce((sum, row) => sum + row.unqualified, 0),
       overdue: rows.reduce((sum, row) => sum + row.overdue, 0),
+      suspended: rows.reduce((sum, row) => sum + row.suspended, 0),
     }),
     [rows]
   );
@@ -346,6 +384,85 @@ export default function StationInstruments() {
     message.success(`已将 ${targetIds.length} 台仪器状态置为待标定`);
   };
 
+  /* ------------------------------ 停用登记 ------------------------------ */
+
+  /** 当前打开停用登记的仪器与其各段停用（按停用日期升序） */
+  const suspensionInstrument = useMemo(
+    () => allInstruments.find((instrument) => instrument.id === suspensionInstrumentId) ?? null,
+    [allInstruments, suspensionInstrumentId]
+  );
+
+  const suspensionRows = useMemo(
+    () =>
+      suspensions
+        .filter((row) => row.instrumentId === suspensionInstrumentId)
+        .sort((a, b) => a.startDate.localeCompare(b.startDate)),
+    [suspensionInstrumentId, suspensions]
+  );
+
+  const openSuspensionModal = (instrument: Instrument) => {
+    setSuspensionInstrumentId(instrument.id);
+    setEditingSuspensionId(null);
+    suspensionForm.setFieldsValue({ startDate: dayjs(), endDate: null, reason: '' });
+  };
+
+  const openSuspensionEdit = (row: Suspension) => {
+    setEditingSuspensionId(row.id);
+    suspensionForm.setFieldsValue({
+      startDate: dayjs(row.startDate),
+      endDate: row.endDate ? dayjs(row.endDate) : null,
+      reason: row.reason,
+    });
+  };
+
+  const submitSuspension = async () => {
+    if (!suspensionInstrument) return;
+    const values = await suspensionForm.validateFields();
+    setSubmitting(true);
+    try {
+      const payload = {
+        startDate: values.startDate ? values.startDate.format('YYYY-MM-DD') : dayjs().format('YYYY-MM-DD'),
+        endDate: values.endDate ? values.endDate.format('YYYY-MM-DD') : '',
+        reason: values.reason?.trim() ?? '',
+      };
+      if (editingSuspensionId) {
+        await dispatch(updateSuspension({ id: editingSuspensionId, patch: payload })).unwrap();
+        message.success('停用段已更新');
+      } else {
+        await dispatch(createSuspension({ instrumentId: suspensionInstrument.id, ...payload })).unwrap();
+        message.success(
+          payload.endDate === ''
+            ? '停用登记已保存：停用期间不参与超期统计与按期标定率'
+            : '停用段已登记，到期日将按停用天数顺延'
+        );
+      }
+      setEditingSuspensionId(null);
+      suspensionForm.setFieldsValue({ startDate: dayjs(), endDate: null, reason: '' });
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '停用登记保存失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleResume = async (row: Suspension) => {
+    try {
+      await dispatch(resumeSuspension({ id: row.id })).unwrap();
+      message.success('已登记恢复：仪器重新参与统计，到期日按停用天数顺延');
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '恢复登记失败');
+    }
+  };
+
+  const handleRemoveSuspension = async (row: Suspension) => {
+    try {
+      await dispatch(removeSuspension(row.id)).unwrap();
+      message.success('停用段已删除');
+    } catch (error) {
+      message.error(typeof error === 'string' ? error : '停用段删除失败');
+    }
+  };
+
   if (!ready) {
     return <Skeleton active paragraph={{ rows: 6 }} />;
   }
@@ -384,7 +501,7 @@ export default function StationInstruments() {
           </Typography.Title>
           <p className="gb-hint">
             维护台站地理坐标与基岩类型并登记仪器；序列号全局唯一，登记后自动生成下一次标定待办（周期
-            365 天）。
+            365 天）。仪器可登记停用段：停用期间不参与超期统计，恢复后到期日按停用天数顺延。
           </p>
         </div>
         <Space wrap>
@@ -420,6 +537,14 @@ export default function StationInstruments() {
           value={totals.overdue}
           suffix="台"
           tone={totals.overdue > 0 ? 'warning' : 'success'}
+          tip="停用中的仪器不参与统计"
+        />
+        <StatBadge
+          label="停用中（已排除）"
+          value={totals.suspended}
+          suffix="台"
+          tone={totals.suspended > 0 ? 'info' : 'default'}
+          tip="停用期间不参与超期统计与按期标定率"
         />
       </div>
 
@@ -517,9 +642,17 @@ export default function StationInstruments() {
             },
             {
               title: '标定提醒',
-              width: 130,
-              render: (_: unknown, row: StationRow) =>
-                row.overdue > 0 ? <Tag color="red">超期 {row.overdue} 台</Tag> : <Tag color="green">按期</Tag>,
+              width: 150,
+              render: (_: unknown, row: StationRow) => (
+                <Space size={4} wrap>
+                  {row.overdue > 0 ? <Tag color="red">超期 {row.overdue} 台</Tag> : <Tag color="green">按期</Tag>}
+                  {row.suspended > 0 ? (
+                    <Tooltip title="停用中的仪器不参与超期统计">
+                      <Tag icon={<PauseCircleOutlined />}>停用 {row.suspended} 台</Tag>
+                    </Tooltip>
+                  ) : null}
+                </Space>
+              ),
             },
             {
               title: '综合结论',
@@ -600,10 +733,18 @@ export default function StationInstruments() {
                 {
                   title: '状态',
                   dataIndex: 'state',
-                  width: 100,
-                  render: (value: string) => (
-                    <Tag color={value === '在用' ? 'green' : value === '待标定' ? 'orange' : 'default'}>{value}</Tag>
-                  ),
+                  width: 170,
+                  render: (value: string, instrument: Instrument) => {
+                    const active = activeSuspensionOf(suspensions, instrument.id);
+                    return (
+                      <div>
+                        <Tag color={value === '在用' ? 'green' : value === '待标定' ? 'orange' : 'default'}>
+                          {value}
+                        </Tag>
+                        {active ? <div className="gb-hint">{suspensionExclusionText(active)}</div> : null}
+                      </div>
+                    );
+                  },
                 },
                 {
                   title: '标定次数',
@@ -637,31 +778,66 @@ export default function StationInstruments() {
                 },
                 {
                   title: '距下次标定',
-                  width: 130,
+                  width: 170,
                   render: (_: unknown, instrument: Instrument) => {
+                    const active = activeSuspensionOf(suspensions, instrument.id);
+                    if (active) {
+                      return (
+                        <div>
+                          <Tag icon={<PauseCircleOutlined />} color="default">
+                            停用中·不计入统计
+                          </Tag>
+                          <div className="gb-hint">{active.startDate} 起停用</div>
+                        </div>
+                      );
+                    }
                     const own = calibrations
                       .filter((row) => row.instrumentId === instrument.id)
                       .sort((a, b) => b.date.localeCompare(a.date));
-                    const last = own.length > 0 ? own[0].date : instrument.installDate;
-                    const days = daysUntilDue(last, instrument.installDate);
+                    const last = own.length > 0 ? own[0].date : null;
+                    const days = daysUntilDueExcludingSuspension(
+                      last,
+                      instrument.installDate,
+                      suspensions,
+                      instrument.id
+                    );
+                    const shift = suspendedDaysAfter(
+                      suspensions,
+                      instrument.id,
+                      last ?? instrument.installDate
+                    );
                     return (
-                      <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
-                        {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}
-                      </span>
+                      <div>
+                        <span className={days < 0 ? 'gb-danger gb-mono' : 'gb-mono'}>
+                          {days < 0 ? `超期 ${Math.abs(days)} 天` : `剩余 ${days} 天`}
+                        </span>
+                        {shift > 0 ? (
+                          <Tooltip title="停用期间标定周期时钟暂停，到期日已按停用天数顺延">
+                            <div className="gb-hint">含停用顺延 {shift} 天</div>
+                          </Tooltip>
+                        ) : null}
+                      </div>
                     );
                   },
                 },
                 {
                   title: '操作',
-                  width: 190,
+                  width: 250,
                   render: (_: unknown, instrument: Instrument) => (
                     <Space size={6}>
                       <Button size="small" onClick={() => openInstrumentEdit(activeStation, instrument)}>
                         编辑
                       </Button>
+                      <Button
+                        size="small"
+                        icon={<PauseCircleOutlined />}
+                        onClick={() => openSuspensionModal(instrument)}
+                      >
+                        停用登记
+                      </Button>
                       <Popconfirm
                         title="删除仪器"
-                        description={`将同时删除其标定与更换记录，确认删除「${instrument.model}」？`}
+                        description={`将同时删除其标定、更换与停用记录，确认删除「${instrument.model}」？`}
                         okText="删除"
                         cancelText="取消"
                         okButtonProps={{ danger: true }}
@@ -785,6 +961,125 @@ export default function StationInstruments() {
             <Input.TextArea rows={2} maxLength={80} placeholder="如：井下安装，深度 42 m" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        open={suspensionInstrument !== null}
+        title={`停用登记 · ${suspensionInstrument?.model ?? ''}（${suspensionInstrument?.serialNo ?? ''}）`}
+        onCancel={() => {
+          setSuspensionInstrumentId(null);
+          setEditingSuspensionId(null);
+        }}
+        footer={null}
+        width={720}
+        destroyOnClose
+      >
+        <p className="gb-hint" style={{ marginTop: 0 }}>
+          恢复日期留空表示仍在停用；停用期间不参与超期统计与按期标定率，恢复后到期日按停用天数顺延。
+          同一台仪器可登记多段停用，每段单独记录且时间不允许重叠。
+        </p>
+        <Table
+          rowKey="id"
+          size="small"
+          className="gb-table-compact"
+          dataSource={suspensionRows}
+          pagination={false}
+          locale={{
+            emptyText: <EmptyPanel title="还没有停用记录" description="在下方表单登记第一段停用。" compact />,
+          }}
+          columns={[
+            {
+              title: '停用段',
+              width: 240,
+              render: (_: unknown, row: Suspension) => (
+                <span className="gb-mono">{suspensionRangeText(row)}</span>
+              ),
+            },
+            {
+              title: '状态',
+              width: 100,
+              render: (_: unknown, row: Suspension) =>
+                row.endDate === '' ? <Tag color="orange">停用中</Tag> : <Tag color="green">已恢复</Tag>,
+            },
+            { title: '停用原因', dataIndex: 'reason', ellipsis: true },
+            {
+              title: '操作',
+              width: 220,
+              render: (_: unknown, row: Suspension) => (
+                <Space size={6}>
+                  {row.endDate === '' ? (
+                    <Button size="small" type="primary" onClick={() => void handleResume(row)}>
+                      登记恢复
+                    </Button>
+                  ) : null}
+                  <Button size="small" icon={<EditOutlined />} onClick={() => openSuspensionEdit(row)}>
+                    编辑
+                  </Button>
+                  <Popconfirm
+                    title="删除停用段"
+                    description="删除后该段停用不再顺延到期日，确认删除？"
+                    okText="删除"
+                    cancelText="取消"
+                    okButtonProps={{ danger: true }}
+                    onConfirm={() => void handleRemoveSuspension(row)}
+                  >
+                    <Button size="small" danger icon={<DeleteOutlined />}>
+                      删除
+                    </Button>
+                  </Popconfirm>
+                </Space>
+              ),
+            },
+          ]}
+        />
+        <Card size="small" className="gb-panel" style={{ marginTop: 12 }} title={editingSuspensionId ? '编辑停用段' : '新增停用段'}>
+          <Form form={suspensionForm} layout="vertical" preserve={false}>
+            <Row gutter={12}>
+              <Col span={8}>
+                <Form.Item name="startDate" label="停用日期" rules={[{ required: true, message: '请填写停用日期' }]}>
+                  <DatePicker style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item name="endDate" label="恢复日期（留空表示仍在停用）">
+                  <DatePicker style={{ width: '100%' }} allowClear />
+                </Form.Item>
+              </Col>
+              <Col span={8}>
+                <Form.Item name="reason" label="停用原因" rules={[{ required: true, message: '请填写停用原因' }]}>
+                  <Input maxLength={60} placeholder="如：故障送修，暂停观测" />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Space wrap style={{ marginBottom: 12 }}>
+              <span className="gb-hint">原因模板：</span>
+              {SUSPENSION_REASON_TEMPLATES.map((template) => (
+                <Button
+                  key={template.key}
+                  size="small"
+                  onClick={() => suspensionForm.setFieldValue('reason', template.reason)}
+                >
+                  {template.reason.slice(0, 8)}…
+                </Button>
+              ))}
+            </Space>
+            <Space>
+              <Button type="primary" loading={submitting} onClick={() => void submitSuspension()}>
+                {editingSuspensionId ? '保存修改' : '登记停用段'}
+              </Button>
+              {editingSuspensionId ? (
+                <Button
+                  onClick={() => {
+                    setEditingSuspensionId(null);
+                    suspensionForm.setFieldsValue({ startDate: dayjs(), endDate: null, reason: '' });
+                  }}
+                >
+                  取消编辑
+                </Button>
+              ) : null}
+            </Space>
+          </Form>
+        </Card>
       </Modal>
     </div>
   );

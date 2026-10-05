@@ -59,12 +59,19 @@ export const createCalibration = createAsyncThunk(
       updatedAt: now,
     };
     await db.calibrations.put(row);
-    // 标定完成后按结论回写仪器状态
+    // 标定完成后按结论回写仪器状态；停用中的仪器保持「已停用」，由停用登记恢复
     if (instrument) {
-      await db.instruments.update(instrument.id, {
-        state: verdict === '不合格' ? '待标定' : '在用',
-        updatedAt: now,
-      } as never);
+      const activeSuspension = await db.suspensions
+        .where('instrumentId')
+        .equals(instrument.id)
+        .filter((suspension) => suspension.endDate === '')
+        .first();
+      if (!activeSuspension) {
+        await db.instruments.update(instrument.id, {
+          state: verdict === '不合格' ? '待标定' : '在用',
+          updatedAt: now,
+        } as never);
+      }
     }
     return row;
   }

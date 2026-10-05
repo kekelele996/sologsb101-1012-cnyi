@@ -12,22 +12,31 @@ import {
   type BackupPayload,
 } from '@/utils/db';
 import type { ResponseVerdict } from '@/types/calibration';
+import { isSuspendedNow, suspendedDaysAfter } from '@/types/suspension';
 import { apertureKm, centroid, haversineKm, round, stationDistances } from '@/utils/geo';
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['arrays', 'stations', 'instruments', 'calibrations', 'replaces'] as const;
+export const BACKUP_KEYS = [
+  'arrays',
+  'stations',
+  'instruments',
+  'calibrations',
+  'replaces',
+  'suspensions',
+] as const;
 export type BackupKey = (typeof BACKUP_KEYS)[number];
 
 export type CountMap = Record<BackupKey, number>;
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, suspensions] = await Promise.all([
     db.arrays.toArray(),
     db.stations.toArray(),
     db.instruments.toArray(),
     db.calibrations.toArray(),
     db.replaces.toArray(),
+    db.suspensions.toArray(),
   ]);
   return {
     app: 'gbseisarray',
@@ -38,6 +47,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     instruments,
     calibrations,
     replaces,
+    suspensions,
   };
 }
 
@@ -56,6 +66,8 @@ export function validateBackup(input: unknown): {
     errors.push('app 字段应为 gbseisarray，文件来源不明');
   }
   for (const key of BACKUP_KEYS) {
+    // suspensions 为 v3 新增表：旧版备份没有该字段，缺失时按空表容忍
+    if (key === 'suspensions' && obj[key] === undefined) continue;
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`);
   }
   if (errors.length > 0) return { ok: false, errors, payload: null };
@@ -68,6 +80,7 @@ export function validateBackup(input: unknown): {
     instruments: obj.instruments ?? [],
     calibrations: obj.calibrations ?? [],
     replaces: obj.replaces ?? [],
+    suspensions: obj.suspensions ?? [],
   };
   return { ok: true, errors, payload };
 }
@@ -80,6 +93,7 @@ export function countPayload(payload: BackupPayload): CountMap {
     instruments: payload.instruments.length,
     calibrations: payload.calibrations.length,
     replaces: payload.replaces.length,
+    suspensions: payload.suspensions.length,
   };
 }
 
@@ -117,13 +131,14 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables();
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.suspensions],
     async () => {
       await db.arrays.bulkPut(payload.arrays);
       await db.stations.bulkPut(payload.stations);
       await db.instruments.bulkPut(payload.instruments);
       await db.calibrations.bulkPut(payload.calibrations);
       await db.replaces.bulkPut(payload.replaces);
+      await db.suspensions.bulkPut(payload.suspensions);
     }
   );
   return countPayload(payload);
@@ -160,7 +175,12 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('rpl'),
     instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
   }));
-  return { ...payload, arrays, stations, instruments, calibrations, replaces };
+  const suspensions = payload.suspensions.map((row) => ({
+    ...row,
+    id: createId('sus'),
+    instrumentId: instrumentMap.get(row.instrumentId) ?? row.instrumentId,
+  }));
+  return { ...payload, arrays, stations, instruments, calibrations, replaces, suspensions };
 }
 
 /** 按台阵汇总的几何与标定结论 */
@@ -187,6 +207,8 @@ export interface ArrayGeometrySummary {
   calibrationCount: number;
   unqualifiedCount: number;
   overdueCount: number;
+  /** 停用中的仪器台数（不参与超期统计） */
+  suspendedCount: number;
   pendingReplaceCount: number;
   conclusion: string;
 }
@@ -222,15 +244,21 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
     const unqualifiedCount = calibrations.filter(
       (calibration) => calibration.responseVerdict === '不合格'
     ).length;
+    // 超期口径与更换提醒页一致：停用中的仪器不参与统计；有停用史的按顺延后的到期日判定
     const overdueCount = instruments.filter((instrument) => {
+      if (isSuspendedNow(payload.suspensions, instrument.id)) return false;
       const rows = calibrations
         .filter((calibration) => calibration.instrumentId === instrument.id)
         .sort((a, b) => b.date.localeCompare(a.date));
       const lastDate = rows.length > 0 ? rows[0].date : instrument.installDate;
       const lastTime = Date.parse(`${lastDate}T00:00:00`);
       if (!Number.isFinite(lastTime)) return true;
-      return today - lastTime > 365 * 86400000;
+      const shiftMs = suspendedDaysAfter(payload.suspensions, instrument.id, lastDate) * 86400000;
+      return today - lastTime - shiftMs > 365 * 86400000;
     }).length;
+    const suspendedCount = instruments.filter((instrument) =>
+      isSuspendedNow(payload.suspensions, instrument.id)
+    ).length;
     const pendingReplaceCount = replaces.filter((replace) => replace.state !== '已复核').length;
 
     const conclusionParts: string[] = [
@@ -240,6 +268,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
     ];
     if (unqualifiedCount > 0) conclusionParts.push(`${unqualifiedCount} 次标定不合格`);
     if (overdueCount > 0) conclusionParts.push(`${overdueCount} 台超期未标定`);
+    if (suspendedCount > 0) conclusionParts.push(`${suspendedCount} 台停用中（不计入超期）`);
     if (pendingReplaceCount > 0) conclusionParts.push(`${pendingReplaceCount} 条更换未闭环`);
 
     return {
@@ -266,6 +295,7 @@ export function buildArraySummaries(payload: BackupPayload): ArrayGeometrySummar
       calibrationCount: calibrations.length,
       unqualifiedCount,
       overdueCount,
+      suspendedCount,
       pendingReplaceCount,
       conclusion: conclusionParts.join('，'),
     };

@@ -26,7 +26,7 @@ import StatBadge from '@/components/common/StatBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import { useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstruments, selectSuspensions } from '@/stores/instrumentSlice';
 import { selectCalibrations, selectReplaces } from '@/stores/calibrationSlice';
 import {
   DB_NAME,
@@ -52,7 +52,14 @@ import {
 } from '@/utils/export';
 import { bearingDeg, round, stationDistances, toLocalPlane, planeViewBox } from '@/utils/geo';
 
-const EMPTY_COUNTS: CountMap = { arrays: 0, stations: 0, instruments: 0, calibrations: 0, replaces: 0 };
+const EMPTY_COUNTS: CountMap = {
+  arrays: 0,
+  stations: 0,
+  instruments: 0,
+  calibrations: 0,
+  replaces: 0,
+  suspensions: 0,
+};
 
 export default function GeometryView() {
   const { message } = AntdApp.useApp();
@@ -60,6 +67,7 @@ export default function GeometryView() {
   const arrays = useAppSelector(selectArrays);
   const stations = useAppSelector(selectStations);
   const instruments = useAppSelector(selectInstruments);
+  const suspensions = useAppSelector(selectSuspensions);
   const calibrations = useAppSelector(selectCalibrations);
   const replaces = useAppSelector(selectReplaces);
 
@@ -86,7 +94,7 @@ export default function GeometryView() {
   useEffect(() => {
     void refresh();
     // 数据变化后刷新统计
-  }, [arrays, stations, instruments, calibrations, replaces]);
+  }, [arrays, stations, instruments, calibrations, replaces, suspensions]);
 
   const activeArrayId = selectedArrayId ?? arrays[0]?.id ?? null;
   const activeArray = arrays.find((row) => row.id === activeArrayId) ?? null;
@@ -106,9 +114,10 @@ export default function GeometryView() {
       instruments,
       calibrations,
       replaces,
+      suspensions,
     };
     return buildArraySummaries(payload);
-  }, [arrays, calibrations, instruments, replaces, stations]);
+  }, [arrays, calibrations, instruments, replaces, stations, suspensions]);
 
   const activeSummary = summaries.find((row) => row.arrayId === activeArrayId) ?? null;
 
@@ -233,7 +242,7 @@ export default function GeometryView() {
     const text = summaries
       .map(
         (row) =>
-          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
+          `${row.arrayName}（${row.state} / ${row.department}）：台站 ${row.stationCount} 个，仪器 ${row.instrumentCount} 台，登记孔径 ${row.recordedApertureKm} km，实算孔径 ${row.computedApertureKm} km，平均台间距 ${row.meanSpacingKm} km，累计标定 ${row.calibrationCount} 次，不合格 ${row.unqualifiedCount} 次，超期 ${row.overdueCount} 台，停用中 ${row.suspendedCount} 台，未闭环更换 ${row.pendingReplaceCount} 条。`
       )
       .join('\n');
     try {
@@ -284,6 +293,7 @@ export default function GeometryView() {
         <StatBadge label="仪器" value={counts.instruments} suffix="台" tone="default" />
         <StatBadge label="标定记录" value={counts.calibrations} suffix="次" tone="success" />
         <StatBadge label="更换记录" value={counts.replaces} suffix="条" tone="warning" />
+        <StatBadge label="停用记录" value={counts.suspensions} suffix="段" tone="info" />
       </div>
 
       {!activeArray || !activeSummary ? (
@@ -385,9 +395,10 @@ export default function GeometryView() {
                     {activeSummary.unqualifiedCount} 次
                   </span>
                 </Descriptions.Item>
-                <Descriptions.Item label="超期未标定 / 未闭环更换">
-                  {activeSummary.overdueCount} 台 / {activeSummary.pendingReplaceCount} 条
+                <Descriptions.Item label="超期未标定 / 停用中">
+                  {activeSummary.overdueCount} 台 / {activeSummary.suspendedCount} 台
                 </Descriptions.Item>
+                <Descriptions.Item label="未闭环更换">{activeSummary.pendingReplaceCount} 条</Descriptions.Item>
                 <Descriptions.Item label="结论">{activeSummary.conclusion}</Descriptions.Item>
               </Descriptions>
             </Card>
@@ -464,6 +475,17 @@ export default function GeometryView() {
               align: 'right',
               render: (value: number) => <span className={value > 0 ? 'gb-danger gb-mono' : 'gb-mono'}>{value}</span>,
             },
+            {
+              title: '停用中',
+              dataIndex: 'suspendedCount',
+              width: 90,
+              align: 'right',
+              render: (value: number) => (
+                <span className="gb-mono" title="停用中的仪器不参与超期统计">
+                  {value}
+                </span>
+              ),
+            },
             { title: '结论', dataIndex: 'conclusion', ellipsis: true },
           ]}
         />
@@ -511,7 +533,7 @@ export default function GeometryView() {
           </Descriptions>
           <p className="gb-hint">
             数据仅保存在当前浏览器 IndexedDB（{DB_NAME}）中，换浏览器或清空站点数据后不会自动跟随，请通过 JSON
-            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces 五张表。
+            备份迁移。导出内容包含 arrays / stations / instruments / calibrations / replaces / suspensions 六张表。
           </p>
         </Space>
       </Card>

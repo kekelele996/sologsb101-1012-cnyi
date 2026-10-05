@@ -1,6 +1,7 @@
 /**
  * 模块 4：/replacements 合格评定与更换提醒
  * 超期未标定仪器高亮、按标定结论登记更换并跟踪状态机到复核闭环。
+ * 停用中的仪器不参与超期台数与按期标定率统计，并在行内标出排除原因。
  * 复用 <StatBadge>、<QualifyTag>。
  */
 import { useEffect, useMemo, useState } from 'react';
@@ -21,9 +22,10 @@ import {
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { DeleteOutlined, EditOutlined, PlusOutlined, WarningFilled } from '@ant-design/icons';
+import { DeleteOutlined, EditOutlined, PauseCircleOutlined, PlusOutlined, WarningFilled } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import FilterBar from '@/components/common/FilterBar';
 import type { FilterModel } from '@/types/filter';
@@ -33,7 +35,7 @@ import EmptyPanel from '@/components/common/EmptyPanel';
 import { ROUTES } from '@/router';
 import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstruments, selectSuspensions } from '@/stores/instrumentSlice';
 import {
   createReplace,
   patchReplaceFilter,
@@ -52,7 +54,13 @@ import {
   type Replace,
   type ReplaceState,
 } from '@/types/replace';
-import { daysUntilDue, type Instrument } from '@/types/instrument';
+import { type Instrument } from '@/types/instrument';
+import {
+  activeSuspensionOf,
+  daysUntilDueExcludingSuspension,
+  suspendedDaysAfter,
+  suspensionExclusionText,
+} from '@/types/suspension';
 import { useCalibHistory } from '@/hooks/useCalibHistory';
 import { initDatabase } from '@/utils/db';
 
@@ -78,6 +86,12 @@ interface AssessmentRow {
   lastVerdict: string;
   calibrationCount: number;
   replace: Replace | null;
+  /** 当前是否停用中（不参与超期统计与按期标定率） */
+  suspended: boolean;
+  /** 排除原因文案（停用中时有值） */
+  exclusionText: string;
+  /** 基准日之后累计顺延的停用天数 */
+  shiftDays: number;
 }
 
 export default function ReplaceBoard() {
@@ -86,6 +100,7 @@ export default function ReplaceBoard() {
   const { message } = AntdApp.useApp();
 
   const instruments = useAppSelector(selectInstruments);
+  const suspensions = useAppSelector(selectSuspensions);
   const stations = useAppSelector(selectStations);
   const arrays = useAppSelector(selectArrays);
   const calibrations = useAppSelector(selectCalibrations);
@@ -102,7 +117,7 @@ export default function ReplaceBoard() {
     if (arrays.length === 0) void initDatabase();
   }, [arrays.length]);
 
-  /** 仪器评定行：结合标定结论与更换记录 */
+  /** 仪器评定行：结合标定结论与更换记录（待标定天数按停用顺延口径） */
   const rows = useMemo<AssessmentRow[]>(() => {
     return instruments
       .map((instrument) => {
@@ -113,7 +128,14 @@ export default function ReplaceBoard() {
           .sort((a, b) => b.date.localeCompare(a.date));
         const latest = own[0];
         const lastDate = latest ? latest.date : instrument.installDate;
-        const dueInDays = daysUntilDue(lastDate, instrument.installDate);
+        const dueInDays = daysUntilDueExcludingSuspension(
+          latest ? latest.date : null,
+          instrument.installDate,
+          suspensions,
+          instrument.id
+        );
+        const active = activeSuspensionOf(suspensions, instrument.id);
+        const suspended = active !== null;
         const replace =
           replaces
             .filter((row) => row.instrumentId === instrument.id)
@@ -125,10 +147,14 @@ export default function ReplaceBoard() {
           arrayName: array?.name ?? '未知台阵',
           lastDate,
           dueInDays,
-          overdue: dueInDays < 0,
+          // 停用中的仪器不参与超期统计
+          overdue: !suspended && dueInDays < 0,
           lastVerdict: latest ? latest.responseVerdict : '待判定',
           calibrationCount: own.length,
           replace,
+          suspended,
+          exclusionText: suspensionExclusionText(active),
+          shiftDays: suspendedDaysAfter(suspensions, instrument.id, lastDate),
         };
       })
       .filter((row) => {
@@ -145,16 +171,29 @@ export default function ReplaceBoard() {
         return true;
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, filter, instruments, replaces, stations]);
+  }, [arrays, calibrations, filter, instruments, replaces, stations, suspensions]);
 
   const totals = useMemo(() => {
-    const overdue = rows.filter((row) => row.overdue).length;
+    // 停用中的仪器从超期台数与按期标定率的分母中剔除
+    const countable = rows.filter((row) => !row.suspended);
+    const suspended = rows.length - countable.length;
+    const overdue = countable.filter((row) => row.overdue).length;
     const unqualified = rows.filter((row) => row.lastVerdict === '不合格').length;
     const pendingReplace = replaces.filter((row) => row.state === '待更换').length;
     const closedReplace = replaces.filter((row) => row.state === '已复核').length;
     const cycleRate =
-      rows.length === 0 ? 0 : Number((((rows.length - overdue) / rows.length) * 100).toFixed(1));
-    return { instruments: rows.length, overdue, unqualified, pendingReplace, closedReplace, cycleRate };
+      countable.length === 0
+        ? 0
+        : Number((((countable.length - overdue) / countable.length) * 100).toFixed(1));
+    return {
+      instruments: rows.length,
+      suspended,
+      overdue,
+      unqualified,
+      pendingReplace,
+      closedReplace,
+      cycleRate,
+    };
   }, [replaces, rows]);
 
   const replaceRows = useMemo(
@@ -268,6 +307,7 @@ export default function ReplaceBoard() {
           </Typography.Title>
           <p className="gb-hint">
             按标定周期（365 天）与脉冲响应结论评定仪器是否合格；超期未标定与不合格仪器高亮提示，可直接登记更换并跟踪到复核闭环。
+            停用中的仪器不参与超期统计与按期标定率，恢复后到期日按停用天数顺延。
           </p>
         </div>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => openCreate()}>
@@ -282,6 +322,7 @@ export default function ReplaceBoard() {
           value={totals.overdue}
           suffix="台"
           tone={totals.overdue > 0 ? 'danger' : 'success'}
+          tip="停用中的仪器不参与统计"
         />
         <StatBadge
           label="结论不合格"
@@ -289,7 +330,20 @@ export default function ReplaceBoard() {
           suffix="台"
           tone={totals.unqualified > 0 ? 'warning' : 'success'}
         />
-        <StatBadge label="按期标定率" value={totals.cycleRate} percent={totals.cycleRate} tone="success" />
+        <StatBadge
+          label="按期标定率"
+          value={totals.cycleRate}
+          percent={totals.cycleRate}
+          tone="success"
+          tip="停用中的仪器已从分母剔除"
+        />
+        <StatBadge
+          label="停用中（已排除）"
+          value={totals.suspended}
+          suffix="台"
+          tone={totals.suspended > 0 ? 'info' : 'default'}
+          tip="停用期间不参与超期统计与按期标定率"
+        />
         <StatBadge label="待更换" value={totals.pendingReplace} suffix="条" tone="warning" />
         <StatBadge label="已复核" value={totals.closedReplace} suffix="条" tone="info" />
       </div>
@@ -382,12 +436,27 @@ export default function ReplaceBoard() {
             },
             {
               title: '标定提醒',
-              width: 160,
-              render: (_: unknown, row: AssessmentRow) => (
-                <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
-                  {row.overdue ? `超期 ${Math.abs(row.dueInDays)} 天` : `剩余 ${row.dueInDays} 天`}
-                </span>
-              ),
+              width: 200,
+              render: (_: unknown, row: AssessmentRow) =>
+                row.suspended ? (
+                  <div>
+                    <Tag icon={<PauseCircleOutlined />} color="default">
+                      停用中·不计入统计
+                    </Tag>
+                    <div className="gb-hint">{row.exclusionText}</div>
+                  </div>
+                ) : (
+                  <div>
+                    <span className={row.overdue ? 'gb-danger gb-mono' : 'gb-mono'}>
+                      {row.overdue ? `超期 ${Math.abs(row.dueInDays)} 天` : `剩余 ${row.dueInDays} 天`}
+                    </span>
+                    {row.shiftDays > 0 ? (
+                      <Tooltip title="停用期间标定周期时钟暂停，到期日已按停用天数顺延">
+                        <div className="gb-hint">含停用顺延 {row.shiftDays} 天</div>
+                      </Tooltip>
+                    ) : null}
+                  </div>
+                ),
             },
             {
               title: '标定结论',

@@ -12,9 +12,10 @@ import type { Instrument } from '@/types/instrument';
 import { judgeCalibration } from '@/types/calibration';
 import type { Calibration } from '@/types/calibration';
 import type { Replace } from '@/types/replace';
+import type { Suspension } from '@/types/suspension';
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbseisarray';
@@ -36,6 +37,7 @@ export interface BackupPayload {
   instruments: Instrument[];
   calibrations: Calibration[];
   replaces: Replace[];
+  suspensions: Suspension[];
 }
 
 export class SeisArrayDatabase extends Dexie {
@@ -44,6 +46,7 @@ export class SeisArrayDatabase extends Dexie {
   instruments!: Table<Instrument, string>;
   calibrations!: Table<Calibration, string>;
   replaces!: Table<Replace, string>;
+  suspensions!: Table<Suspension, string>;
 
   constructor() {
     super(DB_NAME);
@@ -87,6 +90,11 @@ export class SeisArrayDatabase extends Dexie {
             });
         }
       });
+
+    // v3：新增停用登记表（仪器可有多段停用，恢复日期为空表示仍在停用）
+    this.version(3).stores({
+      suspensions: 'id, instrumentId, startDate, updatedAt',
+    });
   }
 }
 
@@ -162,8 +170,9 @@ interface SeedArray {
 }
 
 /**
- * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换，
- * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本。
+ * 播种演示数据：2 个台阵 → 5 个台站 → 8 台仪器 → 14 条标定 + 3 条更换 + 2 段停用，
+ * 覆盖「在用 / 待标定 / 已停用」与「合格 / 不合格」以及超期未标定样本；
+ * 停用样本含 1 段进行中（不参与统计）与 1 段已恢复（演示到期日顺延口径）。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now();
@@ -488,9 +497,31 @@ export async function seedDemoData(): Promise<void> {
     },
   ];
 
+  // 停用登记演示：1 段进行中（雷击损坏的短周期）、1 段已恢复（演示到期日顺延口径）
+  const suspensions: Suspension[] = [
+    {
+      id: 'sus_ltx02_st_1',
+      instrumentId: 'ins_ltx02_st',
+      startDate: daysAgo(90),
+      endDate: '',
+      reason: '雷击损坏送修，暂停观测',
+      createdAt: now - 90 * 86400000,
+      updatedAt: now - 90 * 86400000,
+    },
+    {
+      id: 'sus_ltx01_bb_1',
+      instrumentId: 'ins_ltx01_bb',
+      startDate: '2024-06-01',
+      endDate: '2024-07-01',
+      reason: '台站供电改造，仪器临时撤收',
+      createdAt: now - 200 * 86400000,
+      updatedAt: now - 170 * 86400000,
+    },
+  ];
+
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.suspensions],
     async () => {
       const stamp = (offset: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + offset,
@@ -537,6 +568,7 @@ export async function seedDemoData(): Promise<void> {
       await db.instruments.bulkPut(instrumentRows);
       await db.calibrations.bulkPut(calibrationRows);
       await db.replaces.bulkPut(replaces);
+      await db.suspensions.bulkPut(suspensions);
     }
   );
 }
@@ -555,7 +587,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces],
+    [db.arrays, db.stations, db.instruments, db.calibrations, db.replaces, db.suspensions],
     async () => {
       await Promise.all([
         db.arrays.clear(),
@@ -563,6 +595,7 @@ export async function clearAllTables(): Promise<void> {
         db.instruments.clear(),
         db.calibrations.clear(),
         db.replaces.clear(),
+        db.suspensions.clear(),
       ]);
     }
   );
@@ -576,14 +609,15 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与几何页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [arrays, stations, instruments, calibrations, replaces] = await Promise.all([
+  const [arrays, stations, instruments, calibrations, replaces, suspensions] = await Promise.all([
     db.arrays.count(),
     db.stations.count(),
     db.instruments.count(),
     db.calibrations.count(),
     db.replaces.count(),
+    db.suspensions.count(),
   ]);
-  return { arrays, stations, instruments, calibrations, replaces };
+  return { arrays, stations, instruments, calibrations, replaces, suspensions };
 }
 
 /** 写入结构版本号到 localStorage，便于几何页比对 */

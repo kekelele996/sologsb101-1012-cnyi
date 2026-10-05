@@ -1,14 +1,22 @@
 /**
  * useCalibHistory：按仪器聚合历次标定、算灵敏度变化量与待标定天数。
  * 被标定记录台（/calibrations）与更换提醒页（/replacements）消费。
+ * 待标定天数按停用顺延口径计算；停用中的仪器标记 suspended，不参与超期统计。
  */
 import { useCallback, useMemo } from 'react';
 import { useSelector } from 'react-redux';
 import { selectArrays, selectStations } from '@/stores/arraySlice';
-import { selectInstruments } from '@/stores/instrumentSlice';
+import { selectInstruments, selectSuspensions } from '@/stores/instrumentSlice';
 import { selectCalibrations } from '@/stores/calibrationSlice';
 import { calibrateDueText, sensitivityDelta, type SensitivityDelta } from '@/types/calibration';
-import { CALIBRATION_CYCLE_DAYS, daysUntilDue } from '@/types/instrument';
+import { CALIBRATION_CYCLE_DAYS } from '@/types/instrument';
+import {
+  activeSuspensionOf,
+  daysUntilDueExcludingSuspension,
+  suspendedDaysAfter,
+  suspensionExclusionText,
+  type Suspension,
+} from '@/types/suspension';
 import type { Calibration, ResponseVerdict } from '@/types/calibration';
 import type { Instrument } from '@/types/instrument';
 
@@ -26,12 +34,20 @@ export interface InstrumentCalibHistory {
   delta: SensitivityDelta;
   /** 标定次数 */
   count: number;
-  /** 距下次标定天数（负数为已超期） */
+  /** 距下次标定天数（负数为已超期；已按停用段顺延） */
   dueInDays: number;
-  /** 是否超期未标定 */
+  /** 是否超期未标定（停用中的仪器恒为 false） */
   overdue: boolean;
   /** 是否处于待标定状态 */
   pending: boolean;
+  /** 当前是否停用中（不参与超期统计与按期标定率） */
+  suspended: boolean;
+  /** 进行中的停用段 */
+  activeSuspension: Suspension | null;
+  /** 排除原因文案（停用中时有值） */
+  exclusionText: string;
+  /** 基准日之后累计顺延的停用天数 */
+  suspendedShiftDays: number;
   /** 历次结论中最差的一次 */
   worstVerdict: ResponseVerdict;
   /** 灵敏度序列（由旧到新），供趋势展示 */
@@ -56,6 +72,7 @@ export function useCalibHistory(): UseCalibHistoryResult {
   const stations = useSelector(selectStations);
   const instruments = useSelector(selectInstruments);
   const calibrations = useSelector(selectCalibrations);
+  const suspensions = useSelector(selectSuspensions);
 
   const histories = useMemo<InstrumentCalibHistory[]>(() => {
     return instruments
@@ -68,7 +85,15 @@ export function useCalibHistory(): UseCalibHistoryResult {
         const latest = rows.length > 0 ? rows[0] : null;
         const previous = rows.length > 1 ? rows[1] : null;
         const delta = sensitivityDelta(latest?.sensitivity ?? 0, previous ? previous.sensitivity : null);
-        const dueInDays = daysUntilDue(latest ? latest.date : null, instrument.installDate);
+        const baseDate = latest ? latest.date : instrument.installDate;
+        const dueInDays = daysUntilDueExcludingSuspension(
+          latest ? latest.date : null,
+          instrument.installDate,
+          suspensions,
+          instrument.id
+        );
+        const active = activeSuspensionOf(suspensions, instrument.id);
+        const suspended = active !== null;
         const worstVerdict = rows.reduce<ResponseVerdict>((worst, row) => {
           return VERDICT_ORDER[row.responseVerdict] > VERDICT_ORDER[worst] ? row.responseVerdict : worst;
         }, '合格');
@@ -82,8 +107,13 @@ export function useCalibHistory(): UseCalibHistoryResult {
           delta,
           count: rows.length,
           dueInDays,
-          overdue: dueInDays < 0,
-          pending: instrument.state === '待标定' || dueInDays < 0,
+          // 停用中的仪器不参与超期统计与按期标定率
+          overdue: !suspended && dueInDays < 0,
+          pending: !suspended && (instrument.state === '待标定' || dueInDays < 0),
+          suspended,
+          activeSuspension: active,
+          exclusionText: suspensionExclusionText(active),
+          suspendedShiftDays: suspendedDaysAfter(suspensions, instrument.id, baseDate),
           worstVerdict,
           trend: [...rows]
             .reverse()
@@ -91,7 +121,7 @@ export function useCalibHistory(): UseCalibHistoryResult {
         };
       })
       .sort((a, b) => a.dueInDays - b.dueInDays);
-  }, [arrays, calibrations, instruments, stations]);
+  }, [arrays, calibrations, instruments, stations, suspensions]);
 
   const historyOf = useCallback(
     (instrumentId: string): InstrumentCalibHistory | null =>

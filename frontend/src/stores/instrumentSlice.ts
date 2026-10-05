@@ -1,11 +1,14 @@
 /**
  * 仪器 slice：维护仪器列表、登记草稿与选中台站。
  * 序列号唯一性校验与「登记后自动生成下一次标定待办」在本 slice 的动作里完成。
+ * 同时维护仪器停用登记（一台仪器可多段停用，停用状态与仪器档案联动）。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import { db, createId, watchTable } from '@/utils/db';
 import type { Instrument, InstrumentDraft, InstrumentState, InstrumentType } from '@/types/instrument';
 import { createEmptyInstrumentDraft, daysUntilDue } from '@/types/instrument';
+import type { Suspension } from '@/types/suspension';
+import { validateSuspension } from '@/types/suspension';
 import type { RootState } from '@/stores/store';
 
 /** 选择器入参统一用 RootState */
@@ -13,6 +16,7 @@ type WithInstrument = RootState;
 
 export interface InstrumentSliceState {
   instruments: Instrument[];
+  suspensions: Suspension[];
   ready: boolean;
   error: string | null;
   /** 当前选中的台站（台站仪器页上下文） */
@@ -25,6 +29,7 @@ export interface InstrumentSliceState {
 
 const initialState: InstrumentSliceState = {
   instruments: [],
+  suspensions: [],
   ready: false,
   error: null,
   currentStationId: null,
@@ -77,15 +82,20 @@ export const updateInstrument = createAsyncThunk(
   }
 );
 
-/** 删除仪器：级联删除标定与更换记录 */
+/** 删除仪器：级联删除标定、更换与停用记录 */
 export const removeInstrument = createAsyncThunk(
   'instrument/removeInstrument',
   async (instrumentId: string) => {
-    await db.transaction('rw', [db.instruments, db.calibrations, db.replaces], async () => {
-      await db.calibrations.where('instrumentId').equals(instrumentId).delete();
-      await db.replaces.where('instrumentId').equals(instrumentId).delete();
-      await db.instruments.delete(instrumentId);
-    });
+    await db.transaction(
+      'rw',
+      [db.instruments, db.calibrations, db.replaces, db.suspensions],
+      async () => {
+        await db.calibrations.where('instrumentId').equals(instrumentId).delete();
+        await db.replaces.where('instrumentId').equals(instrumentId).delete();
+        await db.suspensions.where('instrumentId').equals(instrumentId).delete();
+        await db.instruments.delete(instrumentId);
+      }
+    );
     return instrumentId;
   }
 );
@@ -119,6 +129,115 @@ export const applySerialReplace = createAsyncThunk(
   }
 );
 
+/* ------------------------------ 停用登记 ------------------------------ */
+
+/**
+ * 停用登记与仪器档案状态联动：
+ * 存在进行中停用段（恢复日期为空）→ 仪器置「已停用」；全部段均已恢复 → 置回「在用」。
+ */
+async function syncInstrumentStateBySuspension(instrumentId: string, now: number): Promise<void> {
+  const rows = await db.suspensions.where('instrumentId').equals(instrumentId).toArray();
+  const hasActive = rows.some((row) => row.endDate === '');
+  const instrument = await db.instruments.get(instrumentId);
+  if (!instrument) return;
+  if (hasActive && instrument.state !== '已停用') {
+    await db.instruments.update(instrumentId, { state: '已停用', updatedAt: now } as never);
+  } else if (!hasActive && instrument.state === '已停用') {
+    await db.instruments.update(instrumentId, { state: '在用', updatedAt: now } as never);
+  }
+}
+
+/** 登记停用段：恢复日期留空表示仍在停用；同一仪器各段时间不允许重叠 */
+export const createSuspension = createAsyncThunk(
+  'instrument/createSuspension',
+  async (
+    payload: Omit<Suspension, 'id' | 'createdAt' | 'updatedAt'>,
+    { rejectWithValue }
+  ) => {
+    const siblings = await db.suspensions
+      .where('instrumentId')
+      .equals(payload.instrumentId)
+      .toArray();
+    const errors = validateSuspension(payload, siblings);
+    if (errors.length > 0) return rejectWithValue(errors.join('；'));
+    const now = Date.now();
+    const row: Suspension = { ...payload, id: createId('sus'), createdAt: now, updatedAt: now };
+    await db.transaction('rw', [db.suspensions, db.instruments], async () => {
+      await db.suspensions.put(row);
+      await syncInstrumentStateBySuspension(payload.instrumentId, now);
+    });
+    return row;
+  }
+);
+
+/** 编辑停用段（含补登恢复日期） */
+export const updateSuspension = createAsyncThunk(
+  'instrument/updateSuspension',
+  async (
+    payload: { id: string; patch: Partial<Pick<Suspension, 'startDate' | 'endDate' | 'reason'>> },
+    { rejectWithValue }
+  ) => {
+    const existing = await db.suspensions.get(payload.id);
+    if (!existing) return rejectWithValue('停用记录不存在');
+    const next = {
+      startDate: payload.patch.startDate ?? existing.startDate,
+      endDate: payload.patch.endDate ?? existing.endDate,
+    };
+    const siblings = await db.suspensions
+      .where('instrumentId')
+      .equals(existing.instrumentId)
+      .toArray();
+    const errors = validateSuspension(next, siblings, payload.id);
+    if (errors.length > 0) return rejectWithValue(errors.join('；'));
+    const now = Date.now();
+    await db.transaction('rw', [db.suspensions, db.instruments], async () => {
+      await db.suspensions.update(payload.id, { ...payload.patch, updatedAt: now } as never);
+      await syncInstrumentStateBySuspension(existing.instrumentId, now);
+    });
+    return payload;
+  }
+);
+
+/** 登记恢复：把进行中停用段的恢复日期填为指定日期（默认今天） */
+export const resumeSuspension = createAsyncThunk(
+  'instrument/resumeSuspension',
+  async (payload: { id: string; endDate?: string }, { rejectWithValue }) => {
+    const existing = await db.suspensions.get(payload.id);
+    if (!existing) return rejectWithValue('停用记录不存在');
+    if (existing.endDate !== '') return rejectWithValue('该停用段已登记恢复日期');
+    const endDate =
+      payload.endDate && payload.endDate.length > 0
+        ? payload.endDate
+        : new Date().toISOString().slice(0, 10);
+    const siblings = await db.suspensions
+      .where('instrumentId')
+      .equals(existing.instrumentId)
+      .toArray();
+    const errors = validateSuspension({ startDate: existing.startDate, endDate }, siblings, existing.id);
+    if (errors.length > 0) return rejectWithValue(errors.join('；'));
+    const now = Date.now();
+    await db.transaction('rw', [db.suspensions, db.instruments], async () => {
+      await db.suspensions.update(existing.id, { endDate, updatedAt: now } as never);
+      await syncInstrumentStateBySuspension(existing.instrumentId, now);
+    });
+    return { id: existing.id, endDate };
+  }
+);
+
+/** 删除停用段 */
+export const removeSuspension = createAsyncThunk(
+  'instrument/removeSuspension',
+  async (suspensionId: string, { rejectWithValue }) => {
+    const existing = await db.suspensions.get(suspensionId);
+    if (!existing) return rejectWithValue('停用记录不存在');
+    await db.transaction('rw', [db.suspensions, db.instruments], async () => {
+      await db.suspensions.delete(suspensionId);
+      await syncInstrumentStateBySuspension(existing.instrumentId, Date.now());
+    });
+    return suspensionId;
+  }
+);
+
 const instrumentSlice = createSlice({
   name: 'instrument',
   initialState,
@@ -127,6 +246,9 @@ const instrumentSlice = createSlice({
       state.instruments = action.payload;
       state.ready = true;
       state.error = null;
+    },
+    setSuspensions(state, action: PayloadAction<Suspension[]>) {
+      state.suspensions = action.payload;
     },
     setInstrumentError(state, action: PayloadAction<string | null>) {
       state.error = action.payload;
@@ -163,12 +285,36 @@ const instrumentSlice = createSlice({
       })
       .addCase(removeInstrument.fulfilled, (state, action) => {
         state.lastReceipt = `已删除仪器 ${action.payload}`;
+      })
+      .addCase(createSuspension.fulfilled, (state, action) => {
+        state.lastReceipt =
+          action.payload.endDate === ''
+            ? `停用登记已保存（${action.payload.startDate} 起），停用期间不参与超期统计与按期标定率`
+            : `停用段 ${action.payload.startDate} ~ ${action.payload.endDate} 已登记`;
+        state.error = null;
+      })
+      .addCase(createSuspension.rejected, (state, action) => {
+        state.error = typeof action.payload === 'string' ? action.payload : '停用登记失败';
+      })
+      .addCase(updateSuspension.rejected, (state, action) => {
+        state.error = typeof action.payload === 'string' ? action.payload : '停用记录更新失败';
+      })
+      .addCase(resumeSuspension.fulfilled, (state, action) => {
+        state.lastReceipt = `已登记恢复（${action.payload.endDate}），仪器恢复参与统计，到期日按停用天数顺延`;
+        state.error = null;
+      })
+      .addCase(resumeSuspension.rejected, (state, action) => {
+        state.error = typeof action.payload === 'string' ? action.payload : '恢复登记失败';
+      })
+      .addCase(removeSuspension.rejected, (state, action) => {
+        state.error = typeof action.payload === 'string' ? action.payload : '停用记录删除失败';
       });
   },
 });
 
 export const {
   setInstruments,
+  setSuspensions,
   setInstrumentError,
   selectStationForInstrument,
   patchDraft,
@@ -178,12 +324,15 @@ export const {
 
 let started = false;
 
-/** 启动仪器表实时订阅（幂等） */
+/** 启动仪器表与停用登记表实时订阅（幂等） */
 export function startInstrumentSubscription(dispatch: (action: unknown) => void): void {
   if (started) return;
   started = true;
   watchTable<Instrument>(() => db.instruments).subscribe((rows) => {
     dispatch(setInstruments(rows));
+  });
+  watchTable<Suspension>(() => db.suspensions).subscribe((rows) => {
+    dispatch(setSuspensions(rows));
   });
 }
 
@@ -191,6 +340,7 @@ export function startInstrumentSubscription(dispatch: (action: unknown) => void)
 
 export const selectInstrumentState = (state: WithInstrument): InstrumentSliceState => state.instrument;
 export const selectInstruments = (state: WithInstrument): Instrument[] => state.instrument.instruments;
+export const selectSuspensions = (state: WithInstrument): Suspension[] => state.instrument.suspensions;
 export const selectInstrumentReady = (state: WithInstrument): boolean => state.instrument.ready;
 export const selectInstrumentDraft = (state: WithInstrument): InstrumentDraft => state.instrument.draft;
 export const selectInstrumentReceipt = (state: WithInstrument): string => state.instrument.lastReceipt;
@@ -199,6 +349,17 @@ export const selectInstrumentById = (
   state: WithInstrument,
   id: string | null | undefined
 ): Instrument | null => (id ? state.instrument.instruments.find((row) => row.id === id) ?? null : null);
+
+/** 指定仪器的停用段（按停用日期升序） */
+export const selectSuspensionsOfInstrument = (
+  state: WithInstrument,
+  instrumentId: string | null | undefined
+): Suspension[] => {
+  if (!instrumentId) return [];
+  return state.instrument.suspensions
+    .filter((row) => row.instrumentId === instrumentId)
+    .sort((a, b) => a.startDate.localeCompare(b.startDate));
+};
 
 export const selectInstrumentsOfStation = (
   state: WithInstrument,
